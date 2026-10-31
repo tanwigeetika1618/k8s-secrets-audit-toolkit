@@ -1,0 +1,178 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: webapp-sa
+  namespace: secrets-audit-demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp
+  namespace: secrets-audit-demo
+  labels:
+    app: webapp
+    audit-target: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: webapp
+  template:
+    metadata:
+      labels:
+        app: webapp
+        audit-target: "true"
+    spec:
+      serviceAccountName: webapp-sa
+      containers:
+        - name: webapp
+          image: python:3.12-slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              pip install --quiet flask psycopg2-binary 2>/dev/null
+              python /app/app.py
+          ports:
+            - containerPort: 5000
+          # DELIBERATELY INSECURE: secrets injected as env vars
+          # This is the "before" state for the audit
+          env:
+            - name: DB_HOST
+              value: "postgres.secrets-audit-demo.svc.cluster.local"
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              value: "appdb"
+            # Secret from VSO-synced K8s Secret — exposed as env var
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: db-creds
+                  key: username
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-creds
+                  key: password
+            # Additional secrets also exposed as env vars
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: app-creds
+                  key: api_key
+                  optional: true
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: app-creds
+                  key: jwt_secret
+                  optional: true
+          volumeMounts:
+            # DELIBERATELY INSECURE: secret also mounted as file
+            - name: db-creds-volume
+              mountPath: /etc/secrets/db
+              readOnly: true
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 5
+      volumes:
+        - name: db-creds-volume
+          secret:
+            secretName: db-creds
+        - name: app-code
+          configMap:
+            name: webapp-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webapp
+  namespace: secrets-audit-demo
+spec:
+  type: NodePort
+  selector:
+    app: webapp
+  ports:
+    - port: 5000
+      targetPort: 5000
+      nodePort: 30080
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webapp-code
+  namespace: secrets-audit-demo
+data:
+  app.py: |
+    import os
+    import logging
+    from flask import Flask, jsonify
+
+    logging.basicConfig(level=logging.DEBUG)
+    logger = logging.getLogger(__name__)
+
+    app = Flask(__name__)
+
+    db_config = {
+        "host": os.environ.get("DB_HOST", "localhost"),
+        "port": os.environ.get("DB_PORT", "5432"),
+        "dbname": os.environ.get("DB_NAME", "appdb"),
+        "user": os.environ.get("DB_USERNAME", "appuser"),
+        "password": os.environ.get("DB_PASSWORD", ""),
+    }
+
+    # DELIBERATELY INSECURE: log the connection string on startup
+    logger.info(f"Connecting to database: {db_config['host']}:{db_config['port']}/{db_config['dbname']}")
+    logger.debug(f"DB connection config loaded for user: {db_config['user']}")
+
+    @app.route("/health")
+    def health():
+        return jsonify({"status": "healthy", "db_host": db_config["host"]})
+
+    @app.route("/")
+    def index():
+        return jsonify({
+            "app": "secrets-audit-demo",
+            "message": "This app deliberately exposes secrets in multiple ways for audit demonstration",
+            "secret_exposure_points": [
+                "Environment variables (DB_PASSWORD, API_KEY, JWT_SECRET)",
+                "Mounted files at /etc/secrets/db/",
+                "Application memory (db_config dict)",
+                "Logs (connection string logged on startup)",
+            ]
+        })
+
+    @app.route("/db-check")
+    def db_check():
+        try:
+            import psycopg2
+            conn = psycopg2.connect(**db_config)
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+            conn.close()
+            return jsonify({"db": "connected", "status": "ok"})
+        except Exception as e:
+            # DELIBERATELY INSECURE: error message may contain credentials
+            logger.error(f"Database connection failed: {e}")
+            return jsonify({"db": "failed", "error": str(e)}), 500
+
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=5000, debug=True)

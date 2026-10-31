@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp
+  namespace: secrets-audit-demo
+  labels:
+    app: webapp
+    audit-target: "true"
+    fix-pattern: "hybrid"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: webapp
+  template:
+    metadata:
+      labels:
+        app: webapp
+        audit-target: "true"
+        fix-pattern: "hybrid"
+    spec:
+      serviceAccountName: webapp-sa
+      containers:
+        - name: webapp
+          image: python:3.12-slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              pip install --quiet flask psycopg2-binary 2>/dev/null
+              python3 -c "
+              import os, logging
+              from flask import Flask, jsonify
+
+              logging.basicConfig(level=logging.INFO)
+              logger = logging.getLogger(__name__)
+
+              app = Flask(__name__)
+
+              def read_secret(path):
+                  try:
+                      with open(path, 'r') as f:
+                          return f.read().strip()
+                  except FileNotFoundError:
+                      return ''
+
+              # HYBRID PATTERN:
+              # - HIGH sensitivity (DB password): CSI mount (never in etcd)
+              # - LOW sensitivity (DB host, port): VSO sync to K8s Secret (ok in etcd)
+              CSI_SECRETS = '/mnt/secrets-store'
+
+              @app.route('/health')
+              def health():
+                  return jsonify({'status': 'healthy', 'pattern': 'hybrid'})
+
+              @app.route('/')
+              def index():
+                  return jsonify({
+                      'app': 'secrets-audit-demo (hybrid pattern)',
+                      'pattern': 'Hybrid — CSI for sensitive, VSO sync for non-sensitive',
+                      'csi_mounted': ['db-password', 'db-username'],
+                      'vso_synced': ['db-host', 'db-port', 'db-name'],
+                  })
+
+              @app.route('/db-check')
+              def db_check():
+                  try:
+                      import psycopg2
+                      config = {
+                          # Low sensitivity: from env vars (VSO synced K8s Secret)
+                          'host': os.environ.get('DB_HOST', 'localhost'),
+                          'port': os.environ.get('DB_PORT', '5432'),
+                          'dbname': os.environ.get('DB_NAME', 'appdb'),
+                          # High sensitivity: from CSI mount (never in etcd)
+                          'user': read_secret(f'{CSI_SECRETS}/db-username'),
+                          'password': read_secret(f'{CSI_SECRETS}/db-password'),
+                      }
+                      conn = psycopg2.connect(**config)
+                      cur = conn.cursor()
+                      cur.execute('SELECT 1')
+                      cur.close()
+                      conn.close()
+                      logger.info('Database health check passed')
+                      return jsonify({'db': 'connected', 'status': 'ok', 'pattern': 'hybrid'})
+                  except Exception as e:
+                      logger.error('Database connection failed (details redacted)')
+                      return jsonify({'db': 'failed', 'error': 'connection_error'}), 500
+
+              app.run(host='0.0.0.0', port=5000)
+              "
+          ports:
+            - containerPort: 5000
+          env:
+            # LOW sensitivity: ok to have in etcd as K8s Secret
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: db-connection-info
+                  key: host
+            - name: DB_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: db-connection-info
+                  key: port
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: db-connection-info
+                  key: dbname
+          volumeMounts:
+            # HIGH sensitivity: CSI mount (password, username)
+            - name: secrets-store
+              mountPath: /mnt/secrets-store
+              readOnly: true
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: vault-db-creds

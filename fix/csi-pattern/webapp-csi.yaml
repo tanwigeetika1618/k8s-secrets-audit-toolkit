@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp
+  namespace: secrets-audit-demo
+  labels:
+    app: webapp
+    audit-target: "true"
+    fix-pattern: "csi"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: webapp
+  template:
+    metadata:
+      labels:
+        app: webapp
+        audit-target: "true"
+        fix-pattern: "csi"
+    spec:
+      serviceAccountName: webapp-sa
+      containers:
+        - name: webapp
+          image: python:3.12-slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              pip install --quiet flask psycopg2-binary 2>/dev/null
+              python3 -c "
+              import os, logging
+              from flask import Flask, jsonify
+
+              logging.basicConfig(level=logging.INFO)
+              logger = logging.getLogger(__name__)
+
+              app = Flask(__name__)
+
+              def read_secret(path):
+                  try:
+                      with open(path, 'r') as f:
+                          return f.read().strip()
+                  except FileNotFoundError:
+                      return ''
+
+              # SECURE: Read secrets from CSI-mounted files on demand
+              # Secrets are NOT in env vars, NOT cached in memory
+              SECRETS_DIR = '/mnt/secrets-store'
+
+              @app.route('/health')
+              def health():
+                  return jsonify({'status': 'healthy', 'pattern': 'csi-mount'})
+
+              @app.route('/')
+              def index():
+                  return jsonify({
+                      'app': 'secrets-audit-demo (CSI fixed)',
+                      'pattern': 'CSI Secret Store Driver',
+                      'security_improvements': [
+                          'Secrets NOT in etcd (no K8s Secret object)',
+                          'Secrets NOT in environment variables',
+                          'Secrets read from tmpfs on demand (not cached)',
+                          'No credential strings in logs',
+                      ]
+                  })
+
+              @app.route('/db-check')
+              def db_check():
+                  try:
+                      import psycopg2
+                      # Read credentials fresh from CSI mount each time
+                      config = {
+                          'host': read_secret(f'{SECRETS_DIR}/db-host'),
+                          'port': read_secret(f'{SECRETS_DIR}/db-port'),
+                          'dbname': read_secret(f'{SECRETS_DIR}/db-name'),
+                          'user': read_secret(f'{SECRETS_DIR}/db-username'),
+                          'password': read_secret(f'{SECRETS_DIR}/db-password'),
+                      }
+                      conn = psycopg2.connect(**config)
+                      cur = conn.cursor()
+                      cur.execute('SELECT 1')
+                      cur.close()
+                      conn.close()
+                      # SECURE: no credentials in the response or logs
+                      logger.info('Database health check passed')
+                      return jsonify({'db': 'connected', 'status': 'ok', 'pattern': 'csi'})
+                  except Exception as e:
+                      # SECURE: generic error, no credentials leaked
+                      logger.error('Database connection failed (details redacted)')
+                      return jsonify({'db': 'failed', 'error': 'connection_error'}), 500
+
+              app.run(host='0.0.0.0', port=5000)
+              "
+          ports:
+            - containerPort: 5000
+          # SECURE: No secretKeyRef env vars — secrets come from CSI volume only
+          volumeMounts:
+            - name: secrets-store
+              mountPath: /mnt/secrets-store
+              readOnly: true
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+      volumes:
+        # CSI volume: secrets are fetched directly from Vault
+        # and mounted as tmpfs — never stored in etcd
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: vault-db-creds
